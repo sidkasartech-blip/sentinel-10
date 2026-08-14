@@ -1,0 +1,22 @@
+[project]
+name = "sentinel-10"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Siddhesh Kasar", email = "ksiddhesh96.sk@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.122.0",
+    "jupyter>=1.1.1",
+    "python-dotenv>=1.2.2",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+sentinel-10 = "sentinel_10:main"
+
+[build-system]
+requires = ["uv_build>=0.12.4,<0.13.0"]
+build-backend = "uv_build"
