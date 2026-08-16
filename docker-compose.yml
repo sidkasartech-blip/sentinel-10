@@ -1,0 +1,31 @@
+# docker-compose.yml
+# Run everything with: docker compose up -d
+# Stop everything with: docker compose down
+
+services:
+  # Your PostgreSQL + pgvector database
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: sentinel-db
+    environment:
+      POSTGRES_PASSWORD: sentinel123
+      POSTGRES_DB: sentinel10
+    ports:
+      - "5432:5432"
+    volumes:
+      - sentinel_data:/var/lib/postgresql/data  # persists data between restarts
+  
+  # pgAdmin — visual database browser
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: sentinel-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: you@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"                               # open http://localhost:5050
+    depends_on:
+      - db
+
+volumes:
+  sentinel_data:  # named volume so your data survives docker compose down
