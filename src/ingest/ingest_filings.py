@@ -100,7 +100,7 @@ def get_cik(ticker: str) -> tuple[str, str]:
 
     raise ValueError(f"Ticker {ticker} not found in EDGAR")
 
-def get_latest_accession(cik: str, form_type: str) -> tuple[str, str]:
+def get_latest_accession(cik: str, form_type: str) -> tuple[str, str, str]:
     """Returns (raw accession number, filing date) for the latest filing."""
     url  = f"https://data.sec.gov/submissions/CIK{cik}.json"
     data = requests.get(url, headers=HEADERS).json()
@@ -108,42 +108,46 @@ def get_latest_accession(cik: str, form_type: str) -> tuple[str, str]:
     forms      = data["filings"]["recent"]["form"]
     dates      = data["filings"]["recent"]["filingDate"]
     accessions = data["filings"]["recent"]["accessionNumber"]
+    primary_document = data["filings"]["recent"]["primaryDocument"]
 
-    for form, date, acc in zip(forms, dates, accessions):
+    for form, date, acc, document in zip(forms, dates, accessions, primary_document):
         if form == form_type:
-            return acc, date
+            return acc, date, document
 
     raise ValueError(f"No {form_type} found for CIK {cik}")
 
-def get_primary_doc_url(cik: str, accession_raw: str, form_type: str) -> str:
+def get_primary_doc_url(cik: str, accession_raw: str, form_type: str, document_name: str) -> str:
     """Resolves the primary .htm document URL from the filing index."""
     acc_nodash = accession_raw.replace("-", "")
     cik_int    = int(cik)
 
-    index_url = (
-        f"https://www.sec.gov/Archives/edgar/data/"
-        f"{cik_int}/{acc_nodash}/{accession_raw}-index.json"
-    )
-    files = requests.get(index_url, headers=HEADERS).json()["directory"]["item"]
+    # index_url = (
+    #     f"https://www.sec.gov/Archives/edgar/data/"
+    #     f"{cik_int}/{acc_nodash}/{accession_raw}-index.json"
+    # )
+    # files = requests.get(index_url, headers=HEADERS).json()["directory"]["item"]
 
-    def score(f):
-        name  = f["name"].lower()
-        ftype = f.get("type", "").upper()
-        if ftype == form_type and name.endswith(".htm"):   return 0
-        if name.endswith(".htm") and not name.startswith("ex") and "-" in name: return 1
-        if name.endswith(".htm") and not name.startswith("ex"):                 return 2
-        return 99
+    # def score(f):
+    #     name  = f["name"].lower()
+    #     ftype = f.get("type", "").upper()
+    #     if ftype == form_type and name.endswith(".htm"):   return 0
+    #     if name.endswith(".htm") and not name.startswith("ex") and "-" in name: return 1
+    #     if name.endswith(".htm") and not name.startswith("ex"):                 return 2
+    #     return 99
 
-    candidates = sorted([f for f in files if f["name"].endswith(".htm")], key=score)
+    # candidates = sorted([f for f in files if f["name"].endswith(".htm")], key=score)
 
-    if not candidates:
-        raise ValueError(f"No .htm found in filing {accession_raw}")
+    # if not candidates:
+    #     raise ValueError(f"No .htm found in filing {accession_raw}")
 
-    primary = candidates[0]["name"]
-    return (
-        f"https://www.sec.gov/Archives/edgar/data/"
-        f"{cik_int}/{acc_nodash}/{primary}"
-    )
+    # primary = candidates[0]["name"]
+    # return (
+    #     f"https://www.sec.gov/Archives/edgar/data/"
+    #     f"{cik_int}/{acc_nodash}/{primary}"
+    # )
+    doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{document_name}"
+    print(f"Trying document URL: {doc_url}")
+    return doc_url
 
 def fetch_html(url: str) -> str:
     resp = requests.get(url, headers=HEADERS)
@@ -153,29 +157,133 @@ def fetch_html(url: str) -> str:
 # ── Text processing ───────────────────────────────────────────────────────────
 
 def clean_and_section(raw_html: str) -> list[dict]:
-    soup  = BeautifulSoup(raw_html, "lxml")
+    """
+    Parses iXBRL filing HTML, strips XBRL metadata noise,
+    and extracts human-readable sections.
+    
+    Key insight: modern 10-K filings are iXBRL — the XBRL data
+    is embedded IN the HTML. We need to strip it before extracting
+    text, otherwise we get taxonomy URLs instead of prose.
+    """
+    soup = BeautifulSoup(raw_html, "lxml")
+
+    # ── Step 1: Remove all non-prose elements ─────────────────────────────────
+    # Remove script and style (standard)
 
     for tag in soup(["script", "style", "head"]):
         tag.decompose()
 
+    # Remove the XBRL header block — this is where all those
+    # taxonomy URLs live. It's inside <ix:header> or <header> tags.
+    for tag in soup.find_all(["ix:header", "header"]):
+        tag.decompose()
+
+    # Remove hidden elements — XBRL uses display:none divs
+    # to embed structured data invisibly in the document
+    for tag in soup.find_all(style=True):
+        style = tag.get("style", "").lower().replace(" ", "")
+        if "display:none" in style or "visibility:hidden" in style:
+            tag.decompose()
+
+    # Remove ix:hidden blocks specifically
+    for tag in soup.find_all("ix:hidden"):
+        tag.decompose()
+
+    # Remove tables of contents (usually the first <table> in 10-Ks)
+    # They add noise — repetitive section titles with no content
+    toc_removed = 0
+    for table in soup.find_all("table"):
+        cells = table.get_text()
+        # ToC tables have lots of "Item X" references but little prose
+        if cells.count("Item") > 5 and len(cells) < 3000:
+            table.decompose()
+            toc_removed += 1
+
+    # ── Step 2: Extract clean text ────────────────────────────────────────────
+
     full_text = soup.get_text(separator="\n")
-    lines     = [l.strip() for l in full_text.splitlines()]
-    lines     = [l for l in lines if len(l) > 20]
+
+    # Clean up whitespace
+    lines = []
+    for line in full_text.splitlines():
+        line = line.strip()
+        # Skip lines that look like XBRL artifacts (URLs, tag names)
+        if line.startswith("http"):          continue   # taxonomy URLs
+        if line.startswith("us-gaap:"):      continue   # XBRL tag names
+        if line.startswith("dei:"):          continue   # document/entity info tags
+        if line.startswith("aapl:"):         continue   # company-specific tags
+        if line.startswith("msft:"):         continue
+        if line.startswith("nvda:"):         continue
+        if line.startswith("googl:"):        continue
+        if line.startswith("meta:"):         continue
+        if len(line) < 25:                   continue   # short noise lines
+        lines.append(line)
+
     full_text = "\n".join(lines)
 
-    pattern = re.compile(r'(ITEM\s+\d+[A-Z]?\.|Item\s+\d+[A-Z]?\.)', re.IGNORECASE)
-    parts   = pattern.split(full_text)
+    # ── Step 3: Find SEC section boundaries ───────────────────────────────────
+
+    # 10-K sections are always labeled "Item 1.", "Item 1A.", etc.
+    # We split on these markers to get labeled sections
+    pattern = re.compile(
+        r'(?:^|\n)((?:ITEM|Item)\s+\d+[A-Za-z]?\.?\s*[—\-]?\s*'
+        r'(?:Business|Risk|Properties|Legal|Mine|Market|Financial|'
+        r'Quantitative|Controls|Governance|Security|Management|'
+        r'Disclosure|Other)?)',
+        re.MULTILINE
+    )
+
+    parts = re.split(pattern, full_text)
 
     sections      = []
     current_label = "preamble"
 
     for part in parts:
-        if pattern.match(part.strip()):
-            current_label = part.strip().lower().replace(" ", "_").replace(".", "")
-        elif len(part.strip()) > 100:
-            sections.append({"section": current_label, "text": part.strip()})
+        part = part.strip()
+        if not part:
+            continue
 
-    return sections
+        # Check if this part is a section header
+        if re.match(r'(?:ITEM|Item)\s+\d+', part) and len(part) < 100:
+            # Normalize: "Item 1A." → "item_1a"
+            current_label = (
+                part.lower()
+                    .replace("item", "item")
+                    .replace(" ", "_")
+                    .replace(".", "")
+                    .replace("—", "")
+                    .replace("-", "")
+                    .strip("_")
+            )
+        elif len(part) > 150: # real content, not a stray line
+            sections.append({
+                "section": current_label,
+                "text":    part
+            })
+
+    # ── Step 4: Quality check ─────────────────────────────────────────────────
+
+    # Warn if sections look like they still contain XBRL noise
+    clean_sections = []
+    for s in sections:
+        xbrl_density = s["text"].count("us-gaap") + s["text"].count("fasb.org")
+        word_count   = len(s["text"].split())
+        
+        if xbrl_density > 10 and word_count < 500:
+            # More XBRL tags than real words — skip this section
+            continue
+        clean_sections.append(s)
+
+    print(f"  Sections found   : {len(sections)}")
+    print(f"  After XBRL filter: {len(clean_sections)}")
+    print(f"  ToC tables removed: {toc_removed}")
+
+    # Show a preview of what was extracted
+    if clean_sections:
+        preview = clean_sections[0]["text"][:200].replace("\n", " ")
+        print(f"  First section preview: {preview}...")
+
+    return clean_sections
 
 def chunk_sections(sections: list[dict], ticker: str, filing_date: str) -> list[dict]:
     tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -250,10 +358,10 @@ def main():
             cik, company   = get_cik(ticker)
             print(f"  Company : {company}")
 
-            accession, date = get_latest_accession(cik, FORM_TYPE)
+            accession, date, document_name = get_latest_accession(cik, FORM_TYPE)
             print(f"  Filing  : {FORM_TYPE} on {date}")
 
-            doc_url        = get_primary_doc_url(cik, accession)
+            doc_url        = get_primary_doc_url(cik, accession, FORM_TYPE, document_name)
             raw_html       = fetch_html(doc_url)
             print(f"  Fetched : {len(raw_html):,} chars")
 
