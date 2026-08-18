@@ -60,9 +60,8 @@ def _fulltext_search(query: str, ticker: str,top_k: int, conn) -> list[dict]:
     PostgreSQL full-text search using the fts column we created at ingest.
     ts_rank gives a relevance score based on term frequency.
     """
-
-    print('Inovked!!')
     cur = conn.cursor()
+    # Quick count check before the full query
     cur.execute("""
         SELECT
             id,

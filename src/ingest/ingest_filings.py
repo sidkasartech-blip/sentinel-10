@@ -40,15 +40,16 @@ def setup_database():
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS filing_chunks (
-            id           SERIAL PRIMARY KEY,
-            ticker       TEXT    NOT NULL,
-            filing_date  TEXT    NOT NULL,
-            section      TEXT    NOT NULL,
-            chunk_index  INTEGER NOT NULL,
-            text         TEXT    NOT NULL,
-            token_count  INTEGER,
-            embedding    vector(768),
-            created_at   TIMESTAMP DEFAULT NOW()
+            id             SERIAL PRIMARY KEY,
+            ticker         TEXT    NOT NULL,
+            filing_date    TEXT    NOT NULL,
+            section        TEXT    NOT NULL,
+            section_title  TEXT    DEFAULT '',
+            chunk_index    INTEGER NOT NULL,
+            text           TEXT    NOT NULL,
+            token_count    INTEGER,
+            embedding      vector(768),
+            created_at     TIMESTAMP DEFAULT NOW()
         );
     """)
 
@@ -121,30 +122,6 @@ def get_primary_doc_url(cik: str, accession_raw: str, form_type: str, document_n
     acc_nodash = accession_raw.replace("-", "")
     cik_int    = int(cik)
 
-    # index_url = (
-    #     f"https://www.sec.gov/Archives/edgar/data/"
-    #     f"{cik_int}/{acc_nodash}/{accession_raw}-index.json"
-    # )
-    # files = requests.get(index_url, headers=HEADERS).json()["directory"]["item"]
-
-    # def score(f):
-    #     name  = f["name"].lower()
-    #     ftype = f.get("type", "").upper()
-    #     if ftype == form_type and name.endswith(".htm"):   return 0
-    #     if name.endswith(".htm") and not name.startswith("ex") and "-" in name: return 1
-    #     if name.endswith(".htm") and not name.startswith("ex"):                 return 2
-    #     return 99
-
-    # candidates = sorted([f for f in files if f["name"].endswith(".htm")], key=score)
-
-    # if not candidates:
-    #     raise ValueError(f"No .htm found in filing {accession_raw}")
-
-    # primary = candidates[0]["name"]
-    # return (
-    #     f"https://www.sec.gov/Archives/edgar/data/"
-    #     f"{cik_int}/{acc_nodash}/{primary}"
-    # )
     doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{document_name}"
     print(f"Trying document URL: {doc_url}")
     return doc_url
@@ -158,132 +135,145 @@ def fetch_html(url: str) -> str:
 
 def clean_and_section(raw_html: str) -> list[dict]:
     """
-    Parses iXBRL filing HTML, strips XBRL metadata noise,
-    and extracts human-readable sections.
-    
-    Key insight: modern 10-K filings are iXBRL — the XBRL data
-    is embedded IN the HTML. We need to strip it before extracting
-    text, otherwise we get taxonomy URLs instead of prose.
+    Extracts human-readable sections from an iXBRL 10-K filing.
+
+    Key insight from diagnostic: modern 10-Ks have TWO sets of Item markers:
+    1. Table of contents (lines 136-200) — "Item 1.", "Item 1A." etc.
+       These are close together (3 lines apart) with NO content between them.
+    2. Real section headers (line 470+) — "Item 1C.\xa0\xa0\xa0\xa0Cybersecurity"
+       These have non-breaking spaces (\xa0) before the section title,
+       and are followed by thousands of words of real content.
+
+    Strategy: find ALL Item markers, then skip the ToC cluster by only
+    keeping markers that have substantial content (>500 chars) after them.
     """
     soup = BeautifulSoup(raw_html, "lxml")
 
-    # ── Step 1: Remove all non-prose elements ─────────────────────────────────
-    # Remove script and style (standard)
-
-    for tag in soup(["script", "style", "head"]):
+    # ── Strip noise ────────────────────────────────────────────────────────────
+    for tag in soup(["script", "style"]):
         tag.decompose()
-
-    # Remove the XBRL header block — this is where all those
-    # taxonomy URLs live. It's inside <ix:header> or <header> tags.
     for tag in soup.find_all(["ix:header", "header"]):
         tag.decompose()
-
-    # Remove hidden elements — XBRL uses display:none divs
-    # to embed structured data invisibly in the document
+    for tag in soup.find_all("ix:hidden"):
+        tag.decompose()
     for tag in soup.find_all(style=True):
         style = tag.get("style", "").lower().replace(" ", "")
         if "display:none" in style or "visibility:hidden" in style:
             tag.decompose()
 
-    # Remove ix:hidden blocks specifically
-    for tag in soup.find_all("ix:hidden"):
-        tag.decompose()
-
-    # Remove tables of contents (usually the first <table> in 10-Ks)
-    # They add noise — repetitive section titles with no content
-    toc_removed = 0
-    for table in soup.find_all("table"):
-        cells = table.get_text()
-        # ToC tables have lots of "Item X" references but little prose
-        if cells.count("Item") > 5 and len(cells) < 3000:
-            table.decompose()
-            toc_removed += 1
-
-    # ── Step 2: Extract clean text ────────────────────────────────────────────
-
+    # ── Extract and clean text ─────────────────────────────────────────────────
     full_text = soup.get_text(separator="\n")
 
-    # Clean up whitespace
     lines = []
     for line in full_text.splitlines():
         line = line.strip()
-        # Skip lines that look like XBRL artifacts (URLs, tag names)
-        if line.startswith("http"):          continue   # taxonomy URLs
-        if line.startswith("us-gaap:"):      continue   # XBRL tag names
-        if line.startswith("dei:"):          continue   # document/entity info tags
-        if line.startswith("aapl:"):         continue   # company-specific tags
-        if line.startswith("msft:"):         continue
-        if line.startswith("nvda:"):         continue
-        if line.startswith("googl:"):        continue
-        if line.startswith("meta:"):         continue
-        if len(line) < 25:                   continue   # short noise lines
+        if not line or (len(line) < 25 and not re.match(r'Item\s+\d+', line, re.IGNORECASE)): continue
+        if line.startswith("http"):                   continue
+        if re.match(r'^[\w\-]+:[\w\-]+', line):      continue  # xbrl:tags
+        if line.count(":") > 5 and len(line) < 300:  continue  # tag lists
         lines.append(line)
 
     full_text = "\n".join(lines)
 
-    # ── Step 3: Find SEC section boundaries ───────────────────────────────────
-
-    # 10-K sections are always labeled "Item 1.", "Item 1A.", etc.
-    # We split on these markers to get labeled sections
-    pattern = re.compile(
-        r'(?:^|\n)((?:ITEM|Item)\s+\d+[A-Za-z]?\.?\s*[—\-]?\s*'
-        r'(?:Business|Risk|Properties|Legal|Mine|Market|Financial|'
-        r'Quantitative|Controls|Governance|Security|Management|'
-        r'Disclosure|Other)?)',
+    # ── Find ALL Item markers ──────────────────────────────────────────────────
+    # Matches both:
+    #   "Item 1A."                  (ToC style — no title)
+    #   "Item 1C.\xa0\xa0Cybersecurity"  (real header — has title after \xa0)
+    # \xa0 is the non-breaking space character you saw in the diagnostic
+    ITEM_PATTERN = re.compile(
+        r'(?:^|\n)(Item\s+\d+[A-Za-z]?\.?\s*(?:[\xa0\s]+\w+.*)?)',
         re.MULTILINE
     )
 
-    parts = re.split(pattern, full_text)
+    all_matches = list(ITEM_PATTERN.finditer(full_text))
+    print(f"  Total Item markers found: {len(all_matches)}")
 
-    sections      = []
-    current_label = "preamble"
+    # ── Separate ToC entries from real headers ─────────────────────────────────
+    # Key observation: ToC entries are clustered close together.
+    # Real headers have at least 500 characters of content before the next header.
+    # We find the "jump" — where the gap between consecutive markers gets large.
 
-    for part in parts:
-        part = part.strip()
-        if not part:
+    real_matches = []
+    for i, match in enumerate(all_matches):
+        current_pos = match.start()
+        next_pos    = all_matches[i + 1].start() if i + 1 < len(all_matches) else len(full_text)
+        content_len = next_pos - current_pos
+
+        if content_len > 500:
+            # This marker has substantial content after it — it's a real header
+            real_matches.append(match)
+
+    print(f"  Real section headers    : {len(real_matches)}")
+
+    if len(real_matches) < 3:
+        print("  ⚠ Too few real headers found — using paragraph fallback")
+        return _paragraph_fallback(full_text)
+
+    # ── Build sections from real headers ──────────────────────────────────────
+    sections = []
+
+    for i, match in enumerate(real_matches):
+        # Parse the item label — normalize \xa0 to regular space first
+        header_text = match.group(1).replace("\xa0", " ").strip()
+
+        # Extract item number: "Item 1A. Risk Factors" → "item_1a"
+        item_match = re.match(r'Item\s+(\d+[A-Za-z]?)\.?', header_text, re.IGNORECASE)
+        if item_match:
+            item_num = item_match.group(1).lower()
+            label    = f"item_{item_num}"
+        else:
+            label    = f"section_{i}"
+
+        # Extract title if present: "Item 1A.\xa0\xa0Risk Factors" → "Risk Factors"
+        title_match = re.match(
+            r'Item\s+\d+[A-Za-z]?\.?[\xa0\s]+(.+)', header_text, re.IGNORECASE
+        )
+        section_title = title_match.group(1).strip() if title_match else ""
+
+        # Content = everything from end of this header to start of next
+        content_start = match.end()
+        content_end   = real_matches[i + 1].start() if i + 1 < len(real_matches) else len(full_text)
+        section_text  = full_text[content_start:content_end].strip()
+
+        # Skip XBRL-heavy sections
+        xbrl_hits = section_text.count("us-gaap") + section_text.count("fasb.org")
+        if xbrl_hits > 10 and len(section_text.split()) < 500:
+            print(f"  Skipping {label} — XBRL heavy")
             continue
 
-        # Check if this part is a section header
-        if re.match(r'(?:ITEM|Item)\s+\d+', part) and len(part) < 100:
-            # Normalize: "Item 1A." → "item_1a"
-            current_label = (
-                part.lower()
-                    .replace("item", "item")
-                    .replace(" ", "_")
-                    .replace(".", "")
-                    .replace("—", "")
-                    .replace("-", "")
-                    .strip("_")
-            )
-        elif len(part) > 150: # real content, not a stray line
-            sections.append({
-                "section": current_label,
-                "text":    part
-            })
-
-    # ── Step 4: Quality check ─────────────────────────────────────────────────
-
-    # Warn if sections look like they still contain XBRL noise
-    clean_sections = []
-    for s in sections:
-        xbrl_density = s["text"].count("us-gaap") + s["text"].count("fasb.org")
-        word_count   = len(s["text"].split())
-        
-        if xbrl_density > 10 and word_count < 500:
-            # More XBRL tags than real words — skip this section
+        if len(section_text) < 200:
             continue
-        clean_sections.append(s)
 
-    print(f"  Sections found   : {len(sections)}")
-    print(f"  After XBRL filter: {len(clean_sections)}")
-    print(f"  ToC tables removed: {toc_removed}")
+        sections.append({
+            "section": label,
+            "title":   section_title,
+            "text":    section_text
+        })
 
-    # Show a preview of what was extracted
-    if clean_sections:
-        preview = clean_sections[0]["text"][:200].replace("\n", " ")
-        print(f"  First section preview: {preview}...")
+        print(f"  [{label}] {section_title[:40]:<40} {len(section_text):>8,} chars")
 
-    return clean_sections
+    return sections
+
+def _paragraph_fallback(full_text: str) -> list[dict]:
+    """
+    Fallback for heavily styled filings where Item markers aren't detectable.
+    Groups paragraphs into chunks of ~3 paragraphs each.
+    """
+    paragraphs = [
+        p.strip() for p in full_text.split("\n\n")
+        if len(p.strip()) > 150
+    ]
+    sections = []
+    group_size = 3
+    for i in range(0, len(paragraphs), group_size):
+        group = paragraphs[i:i + group_size]
+        sections.append({
+            "section": f"para_group_{i // group_size}",
+            "title":   "",
+            "text":    "\n\n".join(group)
+        })
+    print(f"  Fallback: {len(sections)} groups from {len(paragraphs)} paragraphs")
+    return sections
 
 def chunk_sections(sections: list[dict], ticker: str, filing_date: str) -> list[dict]:
     tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -298,12 +288,13 @@ def chunk_sections(sections: list[dict], ticker: str, filing_date: str) -> list[
     for section in sections:
         for i, text in enumerate(splitter.split_text(section["text"])):
             chunks.append({
-                "ticker":       ticker,
-                "filing_date":  filing_date,
-                "section":      section["section"],
-                "chunk_index":  i,
-                "text":         text,
-                "token_count":  len(tokenizer.encode(text)),
+                "ticker":        ticker,
+                "filing_date":   filing_date,
+                "section":       section["section"],
+                "section_title": section.get("title", ""),
+                "chunk_index":   i,
+                "text":          text,
+                "token_count":   len(tokenizer.encode(text)),
             })
     return chunks
 
@@ -322,17 +313,17 @@ def store_chunks(chunks: list[dict]):
 
     rows = [
         (c["ticker"], c["filing_date"], c["section"],
-         c["chunk_index"], c["text"], c["token_count"], c["embedding"])
+         c["chunk_index"], c["text"], c["token_count"], c["embedding"], c["section_title"])
         for c in chunks
     ]
 
     execute_values(
         cur,
         """INSERT INTO filing_chunks
-           (ticker, filing_date, section, chunk_index, text, token_count, embedding)
+           (ticker, filing_date, section, chunk_index, text, token_count, embedding,section_title)
            VALUES %s""",
         rows,
-        template="(%s,%s,%s,%s,%s,%s,%s::vector)"
+        template="(%s,%s,%s,%s,%s,%s,%s::vector,%s)"
     )
 
     conn.commit()
