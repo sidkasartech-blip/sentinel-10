@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from src.retrieval.retriever import retrieve
 from src.api.rag_chain import generate_answer
 import time
+from src.agents.graph import run_agent
 
 app = FastAPI(
     title="Sentinel-10",
@@ -129,3 +130,19 @@ def compare(req: CompareRequest):
         }
 
     return {"question": req.question, "results": results}
+
+@app.post("/agent/ask")
+def agent_ask(req: AskRequest):
+    """
+    Multi-agent endpoint — routes through the full LangGraph pipeline.
+    Slower than /ask but self-verifying and tone-aware.
+    """
+    ticker = req.ticker.upper()
+    if ticker not in SUPPORTED_TICKERS:
+        raise HTTPException(400, detail=f"Unsupported ticker: {ticker}")
+
+    start  = time.time()
+    result = run_agent(req.question, ticker)
+    result["latency_ms"] = int((time.time() - start) * 1000)
+
+    return result

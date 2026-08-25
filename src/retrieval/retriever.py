@@ -16,6 +16,7 @@ import os
 import psycopg2
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from dotenv import load_dotenv
+from transformers import pipeline
 
 load_dotenv()
 
@@ -24,6 +25,13 @@ print("Loading retrieval models...")
 EMBED_MODEL   = SentenceTransformer("BAAI/bge-base-en-v1.5")
 RERANK_MODEL  = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 print("Retrieval models ready.")
+print("Loading finBERT tone model...")
+TONE_MODEL = pipeline(
+    "text-classification",
+    model="ProsusAI/finbert",
+    return_all_scores=True,
+)
+print("finBERT ready.")
 
 def _vector_search(query_vec: list[float], ticker: str, top_k: int, conn) -> list[dict]:
     """Pure vector similarity search using pgvector cosine distance."""
