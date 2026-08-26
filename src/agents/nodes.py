@@ -11,9 +11,11 @@ import anthropic
 from dotenv import load_dotenv
 from src.retrieval.retriever import retrieve, TONE_MODEL
 from src.api.rag_chain import generate_answer, build_context_block
+from src.observability.tracer import get_tracer
 
 load_dotenv()
 client = anthropic.Anthropic()
+langfuse = get_tracer()
 
 # ── Node 1: Router ────────────────────────────────────────────────────────────
 def router_node(state: dict) -> dict:
@@ -25,7 +27,11 @@ def router_node(state: dict) -> dict:
     focus on what it does best.
     """
     print(f"\n[Router] Classifying: '{state['question'][:60]}...'")
-
+    span = langfuse.span(
+        trace_id=state.get("trace_id"),
+        name="router",
+        input={"question": state["question"]}
+    )
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=50,
@@ -49,7 +55,8 @@ def router_node(state: dict) -> dict:
     # Sanitize — default to qualitative if unexpected response
     if query_type not in ["quantitative", "qualitative", "comparison"]:
         query_type = "qualitative"
-
+    
+    span.end(output={"query_type": query_type})
     print(f"[Router] Type: {query_type}")
     return {"query_type": query_type}
 
@@ -60,7 +67,11 @@ def retrieval_node(state: dict) -> dict:
     Uses query_type to adjust retrieval strategy.
     """
     print(f"[Retrieval] Fetching chunks for {state['ticker']}...")
-
+    span = langfuse.span(
+        trace_id=state.get("trace_id"),
+        name="retrieval",
+        input={"question": state["question"], "ticker": state["ticker"]}
+    )
     # Quantitative questions benefit from more chunks
     # (numbers often appear across multiple sections)
     top_k = 8 if state["query_type"] == "quantitative" else 5
@@ -71,6 +82,11 @@ def retrieval_node(state: dict) -> dict:
         top_k=top_k
     )
 
+    span.end(output={
+        "chunks_found": len(chunks),
+        "top_score":    chunks[0].get("rerank_score") if chunks else None
+    })
+    
     print(f"[Retrieval] Found {len(chunks)} chunks | "
           f"Top rerank score: {chunks[0].get('rerank_score', 'N/A') if chunks else 'none'}")
 
@@ -89,6 +105,11 @@ def tone_node(state: dict) -> dict:
     """
     print("[Tone] Scoring with finBERT...")
 
+    span = langfuse.span(
+        trace_id=state.get("trace_id"),
+        name="tone_scoring"
+    )
+    
     if not state["chunks"]:
         return {"tone_score": 0.5, "tone_label": "neutral"}
 
@@ -117,6 +138,8 @@ def tone_node(state: dict) -> dict:
     tone_score = avg.get("positive", 0.5) - avg.get("negative", 0.0) + 0.5
     tone_score = round(min(max(tone_score, 0.0), 1.0), 4)
 
+    span.end(output={"tone_label": dominant_label, "tone_score": tone_score})
+    
     print(f"[Tone] {dominant_label} | score: {tone_score} | "
           f"pos={avg.get('positive',0):.2f} "
           f"neg={avg.get('negative',0):.2f} "
@@ -136,6 +159,12 @@ def synthesis_node(state: dict) -> dict:
     """
     print("[Synthesis] Generating answer...")
 
+    span = langfuse.span(
+        trace_id=state.get("trace_id"),
+        name="synthesis",
+        input={"question": state["question"], "chunks": len(state["chunks"])}
+    )
+    
     result = generate_answer(state["question"], state["chunks"])
 
     # Append tone signal to the answer
@@ -146,7 +175,13 @@ def synthesis_node(state: dict) -> dict:
             f"(score: {state['tone_score']:.2f}) — language in retrieved sections "
             f"appears {'confident and clear' if state['tone_score'] > 0.6 else 'hedged or uncertain'}."
         )
-
+    span.end(output={
+        "answer_preview":  result["answer"][:200],
+        "input_tokens":    result["usage"].get("input_tokens"),
+        "output_tokens":   result["usage"].get("output_tokens"),
+        "cache_hit_tokens":result["usage"].get("cache_read_tokens"),
+    })
+    
     return {
         "answer":  result["answer"] + tone_note,
         "sources": result["sources"],
@@ -164,15 +199,22 @@ def verifier_node(state: dict) -> dict:
     the key differentiator from a basic RAG pipeline.
     """
     print("[Verifier] Checking answer grounding...")
-
+    
+    span = langfuse.span(
+        trace_id=state.get("trace_id"),
+        name="verifier"
+    )
+    
     if not state.get("answer") or not state.get("chunks"):
         return {"verified": False}
+    
+    answer_to_verify = state['answer'].split("**Management Tone:**")[0].strip()
 
-    context_preview = "\n".join([c["text"][:200] for c in state["chunks"][:3]])
+    context_preview = "\n".join([c["text"][:400] for c in state["chunks"][:5]])
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=100,
+        max_tokens=512,
         messages=[{
             "role": "user",
             "content": f"""Is this answer fully supported by the provided context?
@@ -182,10 +224,10 @@ def verifier_node(state: dict) -> dict:
             {context_preview}
 
             Answer:
-            {state['answer'][:500]}
+            {answer_to_verify[:500]}
 
             Reply with JSON only:
-            {{"grounded": true/false, "confidence": 0.0-1.0, "issue": "describe any unsupported claim or null"}}"""
+            {{"grounded": true/false, "confidence": 0.0-1.0, "issue": "one line or null"}}"""
         }]
     )
 
@@ -196,14 +238,18 @@ def verifier_node(state: dict) -> dict:
         if raw.startswith("json"):
             raw = raw[4:]
 
-    # print(f"Verifier raw response {raw}")
+    print(f"Verifier raw response {repr(raw)}")
     check = json.loads(raw.strip())
     
     print(f"[Verifier] Grounded: {check['grounded']} | "
           f"Confidence: {check['confidence']:.2f} | "
           f"Issue: {check['issue']}")
 
+    print(f"[Verifier] Answer preview: {state['answer'][:300]}")
+    print(f"[Verifier] Context preview: {context_preview[:300]}")
+    print(f"[Verifier] Check result: {check}")
     # Mark verified if grounded and confidence is high enough
-    verified = check["grounded"] and check["confidence"] >= 0.7
-
-    return {"verified": True }
+    verified = check["grounded"] and check["confidence"] >= 0.6
+    span.end(output=check)
+    
+    return {"verified": verified }

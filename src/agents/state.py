@@ -31,3 +31,6 @@ class AgentState(TypedDict):
     answer:      Optional[str]
     sources:     list
     usage:       dict
+    
+    #Langfuse trace id
+    trace_id: Optional[str]

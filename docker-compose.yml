@@ -26,6 +26,29 @@ services:
       - "5050:80"                               # open http://localhost:5050
     depends_on:
       - db
+  
+  langfuse-db:
+    image: postgres:16
+    container_name: langfuse-db
+    environment:
+      POSTGRES_PASSWORD: langfuse123
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_data:/var/lib/postgresql/data
+  
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: langfuse
+    depends_on:
+      - langfuse-db
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:langfuse123@langfuse-db:5432/langfuse
+      NEXTAUTH_SECRET: sentinel-secret-key-change-in-prod
+      NEXTAUTH_URL: http://localhost:3000
+      SALT: sentinel-salt-change-in-prod
 
 volumes:
-  sentinel_data:  # named volume so your data survives docker compose down
+  sentinel_data: 
+  langfuse_data: # named volume so your data survives docker compose down

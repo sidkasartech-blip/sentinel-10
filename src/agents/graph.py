@@ -19,6 +19,8 @@ from src.agents.nodes import (
     synthesis_node,
     verifier_node,
 )
+from src.observability.tracer import get_tracer
+import uuid
 
 def dispatch_parallel(state: dict) -> list:
     """
@@ -122,9 +124,19 @@ def run_agent(question: str, ticker: str) -> dict:
     Main entry point. Runs the full agent graph and returns the result.
     Called by the FastAPI endpoint.
     """
+    langfuse  = get_tracer()
+    trace_id  = str(uuid.uuid4())
+
+    # Create top-level trace for this query
+    trace = langfuse.trace(
+        id=trace_id,
+        name="sentinel-10-query",
+        input={"question": question, "ticker": ticker}
+    )
     initial_state = {
         "question":   question,
         "ticker":     ticker,
+        "trace_id": trace_id,
         "query_type": None,
         "chunks":     [],
         "tone_score": None,
@@ -142,6 +154,17 @@ def run_agent(question: str, ticker: str) -> dict:
 
     final_state = compiled_graph.invoke(initial_state)
 
+    # Close the top-level trace with the final answer
+    trace.update(
+        output={
+            "answer":      final_state["answer"][:300],
+            "verified":    final_state["verified"],
+            "retry_count": final_state["retry_count"],
+            "tone_label":  final_state["tone_label"],
+        }
+    )
+    langfuse.flush()   # ensure trace is sent before response returns
+    
     print(f"\n{'='*55}")
     print(f"DONE | Verified: {final_state['verified']} | "
           f"Retries: {final_state['retry_count']}")
