@@ -147,7 +147,7 @@ def build_test_cases(dataset: list[dict]) -> list[LLMTestCase]:
         print(f"  [{i+1}/{len(dataset)}] {item['ticker']}: {item['question'][:55]}...")
 
         # Run your pipeline
-        chunks = retrieve(item["question"], item["ticker"], top_k=5)
+        chunks = retrieve(item["question"], item["ticker"], top_k=5, form_type=item.get("form_type"))
         result = generate_answer(item["question"], chunks)
 
         # DeepEval LLMTestCase — maps directly to your pipeline outputs

@@ -1,7 +1,7 @@
 """
 src/ingest/ingest_filings.py
 
-Ingests 10-K filings from SEC EDGAR for a list of tickers.
+Ingests 10-K + 10-Q filings from SEC EDGAR for a list of tickers.
 Run with: python -m src.ingest.ingest_filings
 
 This is the production version of notebooks/02_phase1_ingest.ipynb
@@ -29,6 +29,15 @@ TICKERS     = ["AAPL", "MSFT", "GOOGL", "META", "NVDA"]
 FORM_TYPE   = "10-K"
 CHUNK_SIZE  = 500   # tokens
 CHUNK_OVERLAP = 50  # tokens
+TENQ_SECTIONS = {
+    "part_i_item_1":  "Financial Statements",
+    "part_i_item_2":  "Management Discussion and Analysis",
+    "part_i_item_3":  "Quantitative Market Risk Disclosures",
+    "part_i_item_4":  "Controls and Procedures",
+    "part_ii_item_1": "Legal Proceedings",
+    "part_ii_item_1a":"Risk Factors",
+    "part_ii_item_5": "Other Information",
+}
 
 # ── Database setup ────────────────────────────────────────────────────────────
 
@@ -43,12 +52,15 @@ def setup_database():
             id             SERIAL PRIMARY KEY,
             ticker         TEXT    NOT NULL,
             filing_date    TEXT    NOT NULL,
+            form_type      TEXT    DEFAULT '10-K',
             section        TEXT    NOT NULL,
             section_title  TEXT    DEFAULT '',
             chunk_index    INTEGER NOT NULL,
             text           TEXT    NOT NULL,
             token_count    INTEGER,
             embedding      vector(768),
+            fts            tsvector GENERATED ALWAYS AS
+                           (to_tsvector('english', text)) STORED,
             created_at     TIMESTAMP DEFAULT NOW()
         );
     """)
@@ -60,15 +72,21 @@ def setup_database():
     """)
 
     # Full-text search index — needed for hybrid search in Phase 2
-    cur.execute("""
-        ALTER TABLE filing_chunks
-        ADD COLUMN IF NOT EXISTS fts tsvector
-        GENERATED ALWAYS AS (to_tsvector('english', text)) STORED;
-    """)
+    # cur.execute("""
+    #     ALTER TABLE filing_chunks
+    #     ADD COLUMN IF NOT EXISTS fts tsvector
+    #     GENERATED ALWAYS AS (to_tsvector('english', text)) STORED;
+    # """)
 
     cur.execute("""
         CREATE INDEX IF NOT EXISTS chunks_fts_idx
         ON filing_chunks USING gin(fts);
+    """)
+    
+    # Index on form_type for filtered queries
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS chunks_form_type_idx
+        ON filing_chunks(ticker, form_type, filing_date);
     """)
 
     conn.commit()
@@ -76,11 +94,11 @@ def setup_database():
     conn.close()
     print("✓ Database ready")
 
-def clear_ticker(ticker: str):
+def clear_ticker(ticker: str, form_type: str, filing_date: str):
     """Remove existing chunks for a ticker before re-ingesting."""
     conn = psycopg2.connect(CONN_STR)
     cur  = conn.cursor()
-    cur.execute("DELETE FROM filing_chunks WHERE ticker = %s", (ticker,))
+    cur.execute("DELETE FROM filing_chunks WHERE ticker=%s AND form_type=%s AND filing_date=%s", (ticker,form_type,filing_date))
     deleted = cur.rowcount
     conn.commit()
     cur.close()
@@ -101,11 +119,41 @@ def get_cik(ticker: str) -> tuple[str, str]:
 
     raise ValueError(f"Ticker {ticker} not found in EDGAR")
 
+def get_recent_filings(cik: str, form_type: str, max_filings: int = 3) -> list[dict]:
+    """
+    Returns the N most recent filings of a given type for a company.
+    For 10-Q: returns last 3 quarters (Q1, Q2, Q3 of current year)
+    For 10-K: returns last 1 (annual)
+    """
+    url  = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    data = requests.get(url, headers=HEADERS).json()
+    
+    forms         = data["filings"]["recent"]["form"]
+    dates         = data["filings"]["recent"]["filingDate"]
+    accessions    = data["filings"]["recent"]["accessionNumber"]
+    primary_docs  = data["filings"]["recent"]["primaryDocument"]
+    
+    filings = []
+    for form, date, acc, doc in zip(forms, dates, accessions, primary_docs):
+        if form == form_type:
+            filings.append({
+                "form_type":   form_type,
+                "filing_date": date,
+                "accession":   acc,
+                "primary_doc": doc,
+            })
+        if len(filings) >= max_filings:
+            break
+
+    print(f"  Found {len(filings)} {form_type} filings")
+    return filings
+
+# Depricated 
 def get_latest_accession(cik: str, form_type: str) -> tuple[str, str, str]:
     """Returns (raw accession number, filing date) for the latest filing."""
     url  = f"https://data.sec.gov/submissions/CIK{cik}.json"
     data = requests.get(url, headers=HEADERS).json()
-
+    
     forms      = data["filings"]["recent"]["form"]
     dates      = data["filings"]["recent"]["filingDate"]
     accessions = data["filings"]["recent"]["accessionNumber"]
@@ -117,7 +165,7 @@ def get_latest_accession(cik: str, form_type: str) -> tuple[str, str, str]:
 
     raise ValueError(f"No {form_type} found for CIK {cik}")
 
-def get_primary_doc_url(cik: str, accession_raw: str, form_type: str, document_name: str) -> str:
+def get_primary_doc_url(cik: str, accession_raw: str, document_name: str) -> str:
     """Resolves the primary .htm document URL from the filing index."""
     acc_nodash = accession_raw.replace("-", "")
     cik_int    = int(cik)
@@ -132,7 +180,121 @@ def fetch_html(url: str) -> str:
     return resp.text
 
 # ── Text processing ───────────────────────────────────────────────────────────
+def clean_and_section_10q(raw_html: str) -> list[dict]:
+    """
+    10-Q aware section parser.
+    Handles the Part I / Part II structure of quarterly filings.
+    """
+    soup = BeautifulSoup(raw_html, "lxml")
+    
+    # ── Strip noise ────────────────────────────────────────────────────────────
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    for tag in soup.find_all(["ix:header", "header"]):
+        tag.decompose()
+    for tag in soup.find_all("ix:hidden"):
+        tag.decompose()
+    for tag in soup.find_all(style=True):
+        style = tag.get("style", "").lower().replace(" ", "")
+        if "display:none" in style or "visibility:hidden" in style:
+            tag.decompose()
+    
+    full_text = soup.get_text(separator="\n")
+    
+    # Clean lines
+    lines = []
+    for line in full_text.splitlines():
+        line = line.strip()
+        if not line or (len(line) < 25 and not re.match(
+                r'(?:PART|Part)\s+[IVX]+|(?:ITEM|Item)\s+\d+', line)):
+            continue
+        if line.startswith("http"):                  continue
+        if re.match(r'^[\w\-]+:[\w\-]+', line):     continue
+        if line.count(":") > 5 and len(line) < 300: continue
+        lines.append(line)
 
+    full_text = "\n".join(lines)
+    
+    # Match both Part headers and Item headers
+    PART_PATTERN = re.compile(
+        r'(?:^|\n)((?:PART|Part)\s+[IVX]+\.?\s*[\xa0\s]*\w*)',
+        re.MULTILINE
+    )
+    ITEM_PATTERN = re.compile(
+        r'(?:^|\n)((?:ITEM|Item)\s+\d+[A-Za-z]?\.?\s*(?:[\xa0\s]+\w+.*)?)',
+        re.MULTILINE
+    )
+    
+    # Find all markers
+    all_matches = []
+    for m in PART_PATTERN.finditer(full_text):
+        all_matches.append(("part", m))
+    for m in ITEM_PATTERN.finditer(full_text):
+        all_matches.append(("item", m))
+        
+    # Sort by position
+    all_matches.sort(key=lambda x: x[1].start())
+    
+    # Filter to real headers (content > 200 chars after them)
+    real_matches = []
+    for i, (mtype, match) in enumerate(all_matches):
+        next_pos    = all_matches[i+1][1].start() \
+                      if i+1 < len(all_matches) else len(full_text)
+        content_len = next_pos - match.start()
+        if content_len > 200:
+            real_matches.append((mtype, match))
+
+    print(f"  Real section headers: {len(real_matches)}")
+    
+    if len(real_matches) < 2:
+        print("  ⚠ Too few headers — paragraph fallback")
+        return _paragraph_fallback(full_text)
+    
+    # Build sections
+    sections      = []
+    current_part  = "part_i"
+    
+    for i, (mtype, match) in enumerate(real_matches):
+        header = match.group(1).replace("\xa0", " ").strip()
+
+        if mtype == "part":
+            part_match = re.match(
+                r'(?:PART|Part)\s+([IVX]+)', header, re.IGNORECASE
+            )
+            if part_match:
+                roman     = part_match.group(1).upper()
+                roman_map = {"I": "i", "II": "ii", "III": "iii", "IV": "iv"}
+                current_part = f"part_{roman_map.get(roman, roman.lower())}"
+            label = current_part
+        else:
+            item_match = re.match(
+                r'(?:ITEM|Item)\s+(\d+[A-Za-z]?)\.?', header, re.IGNORECASE
+            )
+            item_num = item_match.group(1).lower() if item_match else f"item_{i}"
+            label    = f"{current_part}_item_{item_num}"
+
+        content_start = match.end()
+        content_end   = real_matches[i+1][1].start() \
+                        if i+1 < len(real_matches) else len(full_text)
+        section_text  = full_text[content_start:content_end].strip()
+
+        if len(section_text) < 100:
+            continue
+
+        xbrl_hits = section_text.count("us-gaap") + section_text.count("fasb.org")
+        if xbrl_hits > 10 and len(section_text.split()) < 500:
+            continue
+
+        sections.append({
+            "section": label,
+            "title":   header[:60],
+            "text":    section_text
+        })
+
+        print(f"  [{label}] {header[:40]:<40} {len(section_text):>8,} chars")
+    
+    return sections
+            
 def clean_and_section(raw_html: str) -> list[dict]:
     """
     Extracts human-readable sections from an iXBRL 10-K filing.
@@ -275,7 +437,7 @@ def _paragraph_fallback(full_text: str) -> list[dict]:
     print(f"  Fallback: {len(sections)} groups from {len(paragraphs)} paragraphs")
     return sections
 
-def chunk_sections(sections: list[dict], ticker: str, filing_date: str) -> list[dict]:
+def chunk_sections(sections: list[dict], ticker: str, filing_date: str, form_type: str) -> list[dict]:
     tokenizer = tiktoken.get_encoding("cl100k_base")
     splitter  = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -290,6 +452,7 @@ def chunk_sections(sections: list[dict], ticker: str, filing_date: str) -> list[
             chunks.append({
                 "ticker":        ticker,
                 "filing_date":   filing_date,
+                "form_type":     form_type,
                 "section":       section["section"],
                 "section_title": section.get("title", ""),
                 "chunk_index":   i,
@@ -311,26 +474,63 @@ def store_chunks(chunks: list[dict]):
     conn = psycopg2.connect(CONN_STR)
     cur  = conn.cursor()
 
+    valid   = [c for c in chunks if c["ticker"] in TICKERS]
+    skipped = len(chunks) - len(valid)
+    if skipped:
+        print(f"  Skipped {skipped} invalid chunks")
+        
     rows = [
-        (c["ticker"], c["filing_date"], c["section"],
-         c["chunk_index"], c["text"], c["token_count"], c["embedding"], c["section_title"])
-        for c in chunks
+        (c["ticker"], c["filing_date"], c["form_type"], c["section"], c["section_title"],
+         c["chunk_index"], c["text"], c["token_count"], c["embedding"])
+        for c in valid
     ]
 
     execute_values(
         cur,
         """INSERT INTO filing_chunks
-           (ticker, filing_date, section, chunk_index, text, token_count, embedding,section_title)
+           (ticker, filing_date, form_type, section, section_title,
+            chunk_index, text, token_count, embedding)
            VALUES %s""",
         rows,
-        template="(%s,%s,%s,%s,%s,%s,%s::vector,%s)"
+        template="(%s,%s,%s,%s,%s,%s,%s,%s,%s::vector)"
     )
 
     conn.commit()
+    print(f"  Stored {len(rows)} chunks")
     cur.close()
     conn.close()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+def process_filing(ticker: str, filing: dict, model: SentenceTransformer, cik: str):
+    """Processes a single filing — works for both 10-K and 10-Q."""
+    form_type    = filing["form_type"]
+    filing_date  = filing["filing_date"]
+    accession    = filing["accession"]
+    primary_doc  = filing["primary_doc"]
+    
+    print(f"\n  [{form_type}] {filing_date}")
+    
+    clear_ticker(ticker, form_type, filing_date)
+    
+    doc_url = get_primary_doc_url(cik, accession, primary_doc)
+    raw_html = fetch_html(doc_url)
+    print(f"  Fetched : {len(raw_html):,} chars")
+    
+    # Use form-type aware parser
+    if form_type == "10-Q":
+        sections = clean_and_section_10q(raw_html)
+    else:
+        sections = clean_and_section(raw_html)
+    
+    if not sections:
+        print("  ⚠ No sections extracted — skipping")
+        return
+    
+    chunks = chunk_sections(sections, ticker, filing_date, form_type)
+    chunks = embed_chunks(chunks, model)
+    store_chunks(chunks)
+    
+    time.sleep(1)   # be polite to SEC servers
 
 def main():
     print("Loading BGE embedding model...")
@@ -340,40 +540,28 @@ def main():
     setup_database()
 
     for ticker in TICKERS:
-        print(f"\n{'─'*50}")
+        print(f"\n{'─'*55}")
         print(f"Processing {ticker}...")
 
         try:
-            clear_ticker(ticker)
-
-            cik, company   = get_cik(ticker)
-            print(f"  Company : {company}")
-
-            accession, date, document_name = get_latest_accession(cik, FORM_TYPE)
-            print(f"  Filing  : {FORM_TYPE} on {date}")
-
-            doc_url        = get_primary_doc_url(cik, accession, FORM_TYPE, document_name)
-            raw_html       = fetch_html(doc_url)
-            print(f"  Fetched : {len(raw_html):,} chars")
-
-            sections       = clean_and_section(raw_html)
-            print(f"  Sections: {len(sections)}")
-
-            chunks         = chunk_sections(sections, ticker, date)
-            print(f"  Chunks  : {len(chunks)}")
-
-            chunks         = embed_chunks(chunks, model)
-            store_chunks(chunks)
-            print(f"  ✓ Stored {len(chunks)} chunks")
-
-            # Be polite to SEC servers — don't hammer them
-            time.sleep(1)
-
+            cik, company = get_cik(ticker)
+            print(f"  Company: {company}")
+            
+            # Fetch latest 10-K (1 filing)
+            tenk_filings = get_recent_filings(cik, "10-K", max_filings=1)
+            for filing in tenk_filings:
+                process_filing(ticker, filing, model, cik)
+            
+            # Fetch last 3 10-Qs
+            tenq_filings = get_recent_filings(cik, "10-Q", max_filings=3)
+            for filing in tenq_filings:
+                process_filing(ticker, filing, model, cik)
+                
         except Exception as e:
             print(f"  ✗ Failed: {e}")
             continue
 
-    print(f"\n{'─'*50}")
+    print(f"\n{'─'*55}")
     print("Ingest complete. Running sanity check...\n")
     sanity_check()
 
@@ -381,13 +569,17 @@ def sanity_check():
     conn = psycopg2.connect(CONN_STR)
     cur  = conn.cursor()
 
-    cur.execute("SELECT ticker, COUNT(*) FROM filing_chunks GROUP BY ticker ORDER BY ticker")
+    cur.execute("""
+        SELECT ticker, form_type, COUNT(*) as chunks
+        FROM filing_chunks
+        GROUP BY ticker, form_type
+        ORDER BY ticker, form_type
+    """)
     rows = cur.fetchall()
-
     print("Chunks per company:")
-    for ticker, count in rows:
-        status = "✓" if count > 100 else "⚠ low"
-        print(f"  {ticker}: {count:,} chunks {status}")
+    for ticker, form_type, count in rows:
+        status = "✓" if count > 50 else "⚠ low"
+        print(f"  {ticker} [{form_type}]: {count:,} chunks {status}")
 
     cur.execute("SELECT COUNT(*) FROM filing_chunks WHERE embedding IS NULL")
     nulls = cur.fetchone()[0]

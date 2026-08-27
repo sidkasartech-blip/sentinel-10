@@ -51,7 +51,7 @@ def should_retry(state: dict) -> str:
         return "end"
 
     retry_count = state.get("retry_count", 0)
-    if retry_count < 2:
+    if retry_count < 1:
         print(f"[Graph] Not verified — retry {retry_count + 1}/2")
         return "retry"
 
@@ -85,18 +85,20 @@ def build_graph():
     graph.set_entry_point("router")
 
     # Router fans out to retrieval + tone in parallel
-    graph.add_conditional_edges(
-        "router",
-        dispatch_parallel,
-        # Tell LangGraph which nodes dispatch_parallel can Send to
-        ["retrieval", "tone"]
-    )
+    # graph.add_conditional_edges(
+    #     "router",
+    #     dispatch_parallel,
+    #     # Tell LangGraph which nodes dispatch_parallel can Send to
+    #     ["retrieval", "tone"]
+    # )
     
     # Both parallel nodes feed into synthesis
     # LangGraph waits for ALL incoming edges before running synthesis
-    graph.add_edge("retrieval",       "synthesis")
-    graph.add_edge("tone",            "synthesis")
-    graph.add_edge("synthesis",       "verifier")
+    graph.add_edge("router",    "retrieval")
+    graph.add_edge("retrieval", "tone")       # ← tone gets chunks now
+    graph.add_edge("tone",      "synthesis")
+    graph.add_edge("synthesis", "verifier")
+
 
     # Verifier → conditional: end or retry
     graph.add_conditional_edges(
@@ -119,7 +121,7 @@ def build_graph():
 compiled_graph = build_graph()
 
 
-def run_agent(question: str, ticker: str) -> dict:
+def run_agent(question: str, ticker: str, form_type: str = None) -> dict:
     """
     Main entry point. Runs the full agent graph and returns the result.
     Called by the FastAPI endpoint.
@@ -136,6 +138,7 @@ def run_agent(question: str, ticker: str) -> dict:
     initial_state = {
         "question":   question,
         "ticker":     ticker,
+        "form_type": form_type, 
         "trace_id": trace_id,
         "query_type": None,
         "chunks":     [],

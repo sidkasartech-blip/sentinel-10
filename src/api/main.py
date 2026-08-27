@@ -11,6 +11,7 @@ from src.retrieval.retriever import retrieve
 from src.api.rag_chain import generate_answer
 import time
 from src.agents.graph import run_agent
+from typing import Optional
 
 app = FastAPI(
     title="Sentinel-10",
@@ -30,6 +31,8 @@ class AskRequest(BaseModel):
     ticker:   str  = Field(..., example="AAPL")
     top_k:    int  = Field(3, ge=1, le=10,
                            description="Number of chunks to retrieve")
+    form_type: Optional[str] = Field(None, example="10-Q",
+                           description="Filter by filing type: 10-K, 10-Q, or None for all")
 
 class CompareRequest(BaseModel):
     question: str        = Field(..., min_length=10,
@@ -38,6 +41,8 @@ class CompareRequest(BaseModel):
                                  example=["AAPL", "MSFT", "NVDA"])
     top_k:    int        = Field(3, ge=1, le=10,
                                  description="Chunks per company")
+    form_type: Optional[str] = Field(None, example="10-Q",
+                               description="Filter by filing type: 10-K, 10-Q, or None for all")
 
 class SourceChunk(BaseModel):
     citation_number: int
@@ -92,7 +97,8 @@ def ask(req: AskRequest):
     chunks = retrieve(
         query=req.question,
         ticker=ticker,
-        top_k=req.top_k
+        top_k=req.top_k,
+        form_type=req.form_type
     )
 
     # Step 2 — generate cited answer
@@ -122,7 +128,7 @@ def compare(req: CompareRequest):
 
     results = {}
     for ticker in tickers:
-        chunks = retrieve(req.question, ticker, top_k=req.top_k)
+        chunks = retrieve(req.question, ticker, top_k=req.top_k, form_type=req.form_type)
         result = generate_answer(req.question, chunks)
         results[ticker] = {
             "answer":  result["answer"],
@@ -142,7 +148,7 @@ def agent_ask(req: AskRequest):
         raise HTTPException(400, detail=f"Unsupported ticker: {ticker}")
 
     start  = time.time()
-    result = run_agent(req.question, ticker)
+    result = run_agent(req.question, ticker, form_type=req.form_type)
     result["latency_ms"] = int((time.time() - start) * 1000)
 
     return result

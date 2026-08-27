@@ -79,7 +79,8 @@ def retrieval_node(state: dict) -> dict:
     chunks = retrieve(
         query=state["question"],
         ticker=state["ticker"],
-        top_k=top_k
+        top_k=top_k,
+        form_type=state.get("form_type")
     )
 
     span.end(output={
@@ -104,13 +105,15 @@ def tone_node(state: dict) -> dict:
     Each with a probability score 0.0 → 1.0
     """
     print("[Tone] Scoring with finBERT...")
-
+    
     span = langfuse.span(
         trace_id=state.get("trace_id"),
-        name="tone_scoring"
+        name="tone_scoring",
+        input={"chunks_count": len(state["chunks"])}
     )
     
     if not state["chunks"]:
+        span.end(output={"tone_label": "neutral", "tone_score": 0.5})
         return {"tone_score": 0.5, "tone_label": "neutral"}
 
     # Score top 3 chunks individually then average
@@ -119,8 +122,7 @@ def tone_node(state: dict) -> dict:
 
     for chunk in state["chunks"][:3]:
         text = chunk["text"][:512]
-        results = TONE_MODEL(text)[0]   # list of {label, score}
-
+        results = TONE_MODEL(text)   # list of {label, score}
         for r in results:
             label = r["label"].lower()
             if label in scores:
@@ -202,7 +204,8 @@ def verifier_node(state: dict) -> dict:
     
     span = langfuse.span(
         trace_id=state.get("trace_id"),
-        name="verifier"
+        name="verifier",
+        input={"question": state["question"], "chunks": len(state["chunks"])}
     )
     
     if not state.get("answer") or not state.get("chunks"):

@@ -12,7 +12,7 @@ class AgentState(TypedDict):
     #Input
     question: str
     ticker: str
-
+    form_type:  Optional[str]
     #Router output
     query_type: Optional[str] # "quantitative" | "qualitative" | "comparison"
 
