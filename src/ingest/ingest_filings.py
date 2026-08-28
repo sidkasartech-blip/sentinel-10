@@ -195,6 +195,8 @@ def clean_and_section_10q(raw_html: str) -> list[dict]:
     for tag in soup.find_all("ix:hidden"):
         tag.decompose()
     for tag in soup.find_all(style=True):
+        if tag.decomposed:
+            continue
         style = tag.get("style", "").lower().replace(" ", "")
         if "display:none" in style or "visibility:hidden" in style:
             tag.decompose()
